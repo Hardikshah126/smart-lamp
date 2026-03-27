@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# ML artifacts
+*.h5
+*.tflite
+*.pkl
+logs/
+training_curves.png
+
+# Data (never commit raw dataset)
+ml/data/
+
+# Environment secrets
+.env
+
+# Node / React
+node_modules/
+dashboard/build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/settings.json
