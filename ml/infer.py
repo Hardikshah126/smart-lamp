@@ -1,9 +1,11 @@
 """
 infer.py
-Real-time emotion detection from webcam using the trained model.
-Publishes emotion labels via MQTT to the ESP32.
-Run: python infer.py
+Real-time emotion + MQTT + REAL sensor → ThingSpeak
 """
+
+import sys
+import os
+sys.path.append(os.path.abspath("../cloud"))
 
 import cv2
 import numpy as np
@@ -12,50 +14,47 @@ import time
 from collections import deque
 
 from preprocess import preprocess_frame
+from thingspeak_pusher import ThingSpeakPusher
 
-# ─── Config ───────────────────────────────────────────────────────────────────
+# ─── CONFIG ─────────────────────────
 MODEL_PATH = "model.h5"
 LABELS = ["happy", "stressed", "sleepy"]
-CONFIDENCE_THRESHOLD = 0.35 # below this → default "neutral" / no change
-SMOOTHING_WINDOW = 10          # rolling majority vote over last N frames
-INFERENCE_INTERVAL = 0.5       # run inference every 0.5s to save CPU
 
-# Lighting color map sent to ESP32 (matches your product doc)
+CONFIDENCE_THRESHOLD = 0.35
+SMOOTHING_WINDOW = 10
+INFERENCE_INTERVAL = 0.5
+
 EMOTION_TO_MODE = {
-    "happy":    "FOCUS",    # Bright white
-    "stressed": "CALM",     # Blue
-    "sleepy":   "RELAX",    # Warm yellow
+    "happy": "FOCUS",
+    "stressed": "CALM",
+    "sleepy": "RELAX",
 }
 
-
-# ─── Load Model ───────────────────────────────────────────────────────────────
-def load_model(path: str):
+def load_model(path):
     print(f"[INFO] Loading model from {path}...")
     model = tf.keras.models.load_model(path)
     print("[INFO] Model loaded.")
     return model
 
 
-# ─── Smoothing ────────────────────────────────────────────────────────────────
-def majority_vote(history: deque) -> str:
-    if not history:
-        return "unknown"
+def majority_vote(history):
     from collections import Counter
-    return Counter(history).most_common(1)[0][0]
+    return Counter(history).most_common(1)[0][0] if history else "unknown"
 
 
-# ─── Inference Loop ───────────────────────────────────────────────────────────
-def run_inference(model, mqtt_client=None):
+def run_inference(model, mqtt_client=None, cloud=None):
+
     cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        raise RuntimeError("Cannot open webcam.")
-
     history = deque(maxlen=SMOOTHING_WINDOW)
+
     last_infer_time = 0
+    last_cloud_push = 0
+    last_sent_emotion = None
+
     current_emotion = "unknown"
     current_confidence = 0.0
 
-    print("[INFO] Starting real-time inference. Press Q to quit.")
+    print("[INFO] Running...")
 
     while True:
         ret, frame = cap.read()
@@ -64,19 +63,20 @@ def run_inference(model, mqtt_client=None):
 
         now = time.time()
 
-        # Run inference at limited rate
+        # ─── AI INFERENCE ───
         if now - last_infer_time >= INFERENCE_INTERVAL:
-            processed, face_crop = preprocess_frame(frame)
+
+            processed, _ = preprocess_frame(frame)
 
             if processed is not None:
-                inp = np.expand_dims(processed, axis=0)   # (1, 48, 48, 1)
-                preds = model.predict(inp, verbose=0)[0]   # (3,)
+                inp = np.expand_dims(processed, axis=0)
+                preds = model.predict(inp, verbose=0)[0]
+
                 confidence = float(np.max(preds))
                 label_idx = int(np.argmax(preds))
 
                 if confidence >= CONFIDENCE_THRESHOLD:
-                    detected = LABELS[label_idx]
-                    history.append(detected)
+                    history.append(LABELS[label_idx])
                 else:
                     history.append("unknown")
 
@@ -84,42 +84,68 @@ def run_inference(model, mqtt_client=None):
                 current_confidence = confidence
                 last_infer_time = now
 
-                # Publish to MQTT if client is connected
+                # MQTT send
                 if mqtt_client and current_emotion in EMOTION_TO_MODE:
-                    mode = EMOTION_TO_MODE[current_emotion]
-                    mqtt_client.publish_emotion(current_emotion, mode)
+                    if current_emotion != last_sent_emotion:
+                        mode = EMOTION_TO_MODE[current_emotion]
+                        mqtt_client.publish_emotion(current_emotion, mode)
+                        last_sent_emotion = current_emotion
 
-        # ── Overlay on frame ──────────────────────────────────────────────
-        color_map = {"happy": (0, 255, 100), "stressed": (0, 100, 255), "sleepy": (0, 200, 255), "unknown": (150, 150, 150)}
-        color = color_map.get(current_emotion, (255, 255, 255))
+        # ─── REAL SENSOR → THINGSPEAK ───
+        if cloud and mqtt_client and (now - last_cloud_push >= 15):
 
-        cv2.rectangle(frame, (10, 10), (380, 80), (0, 0, 0), -1)
-        cv2.putText(frame, f"Emotion: {current_emotion.upper()}", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
-        cv2.putText(frame, f"Confidence: {current_confidence:.0%}", (20, 65),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+            ldr = mqtt_client.ldr_value
+            temp = mqtt_client.temperature
+            humidity = mqtt_client.humidity
+            energy = mqtt_client.energy_kwh
+            pir = mqtt_client.pir_value
 
-        cv2.imshow("Smart Lamp - Emotion Engine", frame)
+            if None not in (ldr, temp, humidity, energy, pir):
+
+                print("☁️ Sending REAL sensor data...")
+
+                cloud.push(
+                    ldr=ldr,
+                    temperature=temp,
+                    humidity=humidity,
+                    energy_kwh=energy,
+                    emotion=current_emotion,
+                    pir=pir
+                )
+
+                last_cloud_push = now
+            else:
+                print("⚠️ Waiting for sensor data...")
+
+        # ─── UI ───
+        cv2.putText(frame, f"{current_emotion} ({current_confidence:.0%})",
+                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,0), 2)
+
+        cv2.imshow("Smart Lamp", frame)
+
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
     cap.release()
     cv2.destroyAllWindows()
-    print("[INFO] Inference stopped.")
 
 
-# ─── Entry Point ──────────────────────────────────────────────────────────────
+# ─── MAIN ─────────────────────────
 if __name__ == "__main__":
-    # Optional: import MQTT client for live hardware control
-    try:
-        import sys
-        sys.path.append("../edge")
-        from mqtt_client import MQTTClient
-        mqtt = MQTTClient()
-        mqtt.connect()
-    except Exception as e:
-        print(f"[WARNING] MQTT not connected: {e}. Running in display-only mode.")
-        mqtt = None
 
+    # MQTT
+    import sys
+    sys.path.append("../edge")
+    from mqtt_client import MQTTClient
+
+    mqtt = MQTTClient()
+    mqtt.connect()
+
+    # Cloud
+    cloud = ThingSpeakPusher()
+
+    # Model
     model = load_model(MODEL_PATH)
-    run_inference(model, mqtt_client=mqtt)
+
+    # Run
+    run_inference(model, mqtt_client=mqtt, cloud=cloud)
